@@ -1,4 +1,6 @@
 models/*
 !models/.gitkeep
+data/output/*
+!data/output/.gitkeep
 .venv/
 __pycache__/

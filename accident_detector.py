@@ -33,6 +33,8 @@ class AccidentDetector:
                         accidents.append({
                             "v1": id1,
                             "v2": id2,
+                            "class1": data1.get("class", "unknown"),
+                            "class2": data2.get("class", "unknown"),
                             "location": center1
                         })
 

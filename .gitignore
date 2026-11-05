@@ -2,6 +2,12 @@ models/*
 !models/.gitkeep
 data/output/*
 !data/output/.gitkeep
+data/input/*
+!data/input/.gitkeep
+data/camera_profiles/*.json
+data/anchor_vi.db
+data/anchor_vi.db-wal
+data/anchor_vi.db-shm
 .venv/
 __pycache__/
 env/

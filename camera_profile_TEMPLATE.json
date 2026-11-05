@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "camera_id": "CCTV-CHANGE-ME",
+  "camera_name": "Nama CCTV",
+  "camera_view": "diagonal",
+  "image_size": null,
+  "calibration": {
+    "mode": "pixel_only"
+  }
+}

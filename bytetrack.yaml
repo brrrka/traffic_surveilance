@@ -8,6 +8,6 @@ new_track_thresh: 0.6
 
 track_buffer: 60
 
-match_thresh: 0.85
+match_thresh: 0.5
 
 fuse_score: True

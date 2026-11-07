@@ -3,19 +3,27 @@
 Run from the backend project directory:
     python -m uvicorn api:app --host 127.0.0.1 --port 8001 --reload
 """
-import math
+import ctypes
+import base64
+import hashlib
+import hmac
+from datetime import datetime
 import json
 import logging
+import math
+import os
+from pathlib import Path
+import platform
 import shutil
+import socket
 import subprocess
+import sys
 import traceback
 import uuid
-
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import cv2
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -59,6 +67,55 @@ app.add_middleware(
 )
 
 executor = ThreadPoolExecutor(max_workers=1)
+AUTH_EMAIL = os.environ.get("ANCHOR_ADMIN_EMAIL", "admin@anchorvi.com")
+AUTH_PASSWORD = os.environ.get("ANCHOR_ADMIN_PASSWORD")
+AUTH_SECRET = os.environ.get("ANCHOR_AUTH_SECRET") or uuid.uuid4().hex
+
+
+def _issue_token() -> str:
+    payload = f"{AUTH_EMAIL}|{int(datetime.now().timestamp()) + 8 * 60 * 60}"
+    encoded = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    signature = hmac.new(AUTH_SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _valid_token(token: str | None) -> bool:
+    if not token or "." not in token:
+        return False
+    encoded, signature = token.rsplit(".", 1)
+    expected = hmac.new(AUTH_SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return False
+    try:
+        email, expires = base64.urlsafe_b64decode(encoded + "==").decode().split("|", 1)
+        return email == AUTH_EMAIL and int(expires) > int(datetime.now().timestamp())
+    except (ValueError, UnicodeDecodeError, base64.binascii.Error):
+        return False
+
+
+@app.middleware("http")
+async def require_api_auth(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.url.path not in {"/api/auth/login", "/api/health"}:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        token = token or request.query_params.get("access_token")
+        if not _valid_token(token):
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=401, content={"detail": "Sesi login tidak valid atau sudah kedaluwarsa."})
+    return await call_next(request)
+
+
+@app.post("/api/auth/login")
+def login(payload: dict = Body(...)):
+    if not AUTH_PASSWORD:
+        raise HTTPException(status_code=503, detail="ANCHOR_ADMIN_PASSWORD belum dikonfigurasi di server.")
+    email = str(payload.get("email") or "").strip().lower()
+    password = str(payload.get("password") or "")
+    if not hmac.compare_digest(email, AUTH_EMAIL.lower()) or not hmac.compare_digest(password, AUTH_PASSWORD):
+        raise HTTPException(status_code=401, detail="Email atau password salah.")
+    return {"access_token": _issue_token(), "user": {
+        "name": "ANCHOR VI Administrator", "role": "Administrator",
+        "institution": "ANCHOR VI", "email": AUTH_EMAIL,
+    }}
 
 
 def update_job(job_id, **changes):
@@ -100,9 +157,38 @@ def run_analysis(job_id, input_path, output_path, metadata):
         if width <= 0 or height <= 0:
             raise RuntimeError("Resolusi video tidak valid.")
 
-        writer = cv2.VideoWriter(
-            str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-        )
+        # Inisialisasi VideoWriter yang kompatibel langsung dengan browser HTML5 (H.264 / avc1)
+        writer = None
+        writer_codec = "mp4v"
+        codecs_to_try = [
+            (cv2.CAP_MSMF, "H264"),
+            (cv2.CAP_MSMF, "avc1"),
+            (cv2.CAP_ANY, "avc1"),
+            (cv2.CAP_ANY, "H264"),
+            (cv2.CAP_ANY, "mp4v"),
+        ] if sys.platform.startswith("win") else [
+            (cv2.CAP_ANY, "avc1"),
+            (cv2.CAP_ANY, "H264"),
+            (cv2.CAP_ANY, "mp4v"),
+        ]
+
+        for backend, codec_tag in codecs_to_try:
+            try:
+                candidate_writer = cv2.VideoWriter(
+                    str(output_path), backend, cv2.VideoWriter_fourcc(*codec_tag), fps, (width, height)
+                )
+                if candidate_writer.isOpened():
+                    writer = candidate_writer
+                    writer_codec = codec_tag
+                    break
+            except Exception:
+                continue
+
+        if writer is None or not writer.isOpened():
+            writer = cv2.VideoWriter(
+                str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+            )
+            writer_codec = "mp4v"
         if not writer.isOpened():
             raise RuntimeError("VideoWriter gagal membuat video output.")
 
@@ -274,7 +360,11 @@ def run_analysis(job_id, input_path, output_path, metadata):
             "pair_comparison_count": len(pair_diagnostics),
         }
 
-        codec_note = "Output video MP4 (OpenCV codec mp4v)."
+        if writer_codec in {"H264", "avc1"}:
+            codec_note = "Output video MP4 H.264 siap diputar langsung di browser."
+        else:
+            codec_note = f"Output video MP4 (OpenCV codec {writer_codec})."
+
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path:
             h264_path = output_path.with_name(output_path.stem + "_h264.mp4")
@@ -288,10 +378,9 @@ def run_analysis(job_id, input_path, output_path, metadata):
                 subprocess.run(command, check=True, capture_output=True, text=True)
                 if h264_path.is_file() and h264_path.stat().st_size > 0:
                     h264_path.replace(output_path)
-                    codec_note = "Output video MP4 H.264 siap diputar di browser."
+                    codec_note = "Output video MP4 H.264 (web optimized +faststart) siap diputar langsung di browser."
             except (subprocess.CalledProcessError, OSError):
                 h264_path.unlink(missing_ok=True)
-                codec_note = "Konversi H.264 gagal; file MP4 asli tetap disimpan."
 
         def event_score(item):
             ev = item["event"]
@@ -366,6 +455,11 @@ def run_analysis(job_id, input_path, output_path, metadata):
             analysis_pipeline_build="ANCHOR-VI-pipeline-3.4",
             tracklet_recovery_build=TRACKLET_RECOVERY_BUILD_ID,
         )
+        # Persist completed results server-side immediately. The dashboard can
+        # be closed or refreshed and the result will still appear in history.
+        completed_job = job_store.get_job(job_id)
+        if completed_job:
+            job_store.create_case_from_job(completed_job)
 
     except Exception as exc:
         # Keep the complete traceback in the backend terminal and in the job
@@ -424,8 +518,101 @@ def run_analysis(job_id, input_path, output_path, metadata):
             logger.exception("[ANCHOR VI] Failed to remove uploaded input | job_id=%s | path=%s", job_id, input_path)
 
 
+def get_system_telemetry():
+    """Scrape local machine and hardware specifications without requiring manual input."""
+    cpu_cores = os.cpu_count() or 1
+    processor_name = platform.processor() or "Unknown CPU"
+    
+    ram_info = {"total_gb": None, "available_gb": None, "used_gb": None, "percent_used": None}
+    try:
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                ('sullAvailExtendedVirtual', ctypes.c_ulonglong)
+            ]
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if hasattr(ctypes, 'windll') and hasattr(ctypes.windll, 'kernel32'):
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                ram_info = {
+                    "total_gb": round(stat.ullTotalPhys / (1024**3), 2),
+                    "available_gb": round(stat.ullAvailPhys / (1024**3), 2),
+                    "used_gb": round((stat.ullTotalPhys - stat.ullAvailPhys) / (1024**3), 2),
+                    "percent_used": int(stat.dwMemoryLoad)
+                }
+    except Exception:
+        pass
+
+    disk_info = {"total_gb": None, "free_gb": None}
+    try:
+        du = shutil.disk_usage(str(ROOT))
+        disk_info = {
+            "total_gb": round(du.total / (1024**3), 2),
+            "free_gb": round(du.free / (1024**3), 2)
+        }
+    except Exception:
+        pass
+
+    import torch
+    cuda_available = torch.cuda.is_available()
+    gpu_name = torch.cuda.get_device_name(0) if cuda_available else "CPU (Multi-threaded)"
+    gpu_device_count = torch.cuda.device_count() if cuda_available else 0
+
+    hostname = socket.gethostname()
+    try:
+        host_ip = socket.gethostbyname(hostname)
+    except Exception:
+        host_ip = "127.0.0.1"
+
+    return {
+        "status": "connected",
+        "hostname": hostname,
+        "host_ip": host_ip,
+        "port": 8001,
+        "os": f"{platform.system()} {platform.release()}",
+        "os_version": platform.version(),
+        "architecture": platform.machine(),
+        "processor": processor_name,
+        "cpu_cores": cpu_cores,
+        "ram": ram_info,
+        "disk": disk_info,
+        "gpu": {
+            "cuda_available": cuda_available,
+            "device_name": gpu_name,
+            "device_count": gpu_device_count,
+            "torch_version": torch.__version__
+        },
+        "python": {
+            "version": platform.python_version(),
+            "executable": sys.executable
+        },
+        "model": {
+            "name": "YOLO11s",
+            "file": MODEL_PATH.name,
+            "available": MODEL_PATH.is_file(),
+            "path": str(MODEL_PATH),
+            "pipeline_build": "ANCHOR-VI-pipeline-3.4",
+            "contact_detector_build": AccidentDetector.BUILD_ID,
+            "speed_engine_build": SPEED_ENGINE_BUILD_ID,
+            "tracklet_recovery_build": TRACKLET_RECOVERY_BUILD_ID,
+        },
+        "opencv_version": cv2.__version__,
+        "fastapi_version": app.version
+    }
+
+
+@app.get("/api/server-info")
+def server_info():
+    """Scrape and return live hardware & system specifications of this AI processing node."""
+    return get_system_telemetry()
+
+
 @app.get("/api/health")
 def health():
+    telemetry = get_system_telemetry()
     return {
         "status": "ok",
         "model_available": MODEL_PATH.is_file(),
@@ -438,6 +625,7 @@ def health():
         "tracklet_recovery_build": TRACKLET_RECOVERY_BUILD_ID,
         "camera_calibration_mode": "auto_with_explicit_metric_uncertainty",
         "crash_scenario_count": 7,
+        "system_info": telemetry,
     }
 
 
@@ -607,14 +795,47 @@ def job_status(job_id: str):
 
 
 @app.get("/api/results/{job_id}")
-def video_result(job_id: str):
+def video_result(job_id: str, download: bool = False):
     job = job_store.get_job(job_id)
     if job is None or job.get("status") != "completed":
         raise HTTPException(status_code=404, detail="Hasil video belum tersedia.")
     path = OUTPUT_DIR / f"{job_id}.mp4"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File video hasil tidak ditemukan.")
-    return FileResponse(str(path), media_type="video/mp4", filename=f"ANCHOR_VI_{job_id}.mp4")
+    
+    if download:
+        return FileResponse(
+            str(path),
+            media_type="video/mp4",
+            filename=f"ANCHOR_VI_{job_id}.mp4",
+            content_disposition_type="attachment"
+        )
+    return FileResponse(
+        str(path),
+        media_type="video/mp4",
+        content_disposition_type="inline"
+    )
+
+
+@app.get("/api/results/{job_id}/download")
+def video_download_endpoint(job_id: str):
+    """Explicit download endpoint with attachment header for direct video saving."""
+    return video_result(job_id=job_id, download=True)
+
+
+@app.get("/assets/download.pdf")
+def get_download_pdf():
+    """Serve ASEAN NCAP protocol PDF catalogue from assets."""
+    candidates = [
+        ROOT / "assets" / "download.pdf",
+        DASHBOARD_DIST / "assets" / "download.pdf",
+        ROOT.parent / "Dashboard" / "public" / "assets" / "download.pdf",
+        ROOT.parent / "Dashboard" / "src" / "assets" / "download.pdf",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return FileResponse(str(p), media_type="application/pdf", filename="download.pdf")
+    raise HTTPException(status_code=404, detail="File download.pdf tidak ditemukan di folder assets.")
 
 
 
@@ -696,8 +917,15 @@ def cases_detail(case_id: str):
 
 @app.delete("/api/cases/{case_id}")
 def cases_delete(case_id: str):
+    record = job_store.get_case(case_id)
     if not job_store.delete_case(case_id):
         raise HTTPException(status_code=404, detail="Kasus tidak ditemukan.")
+    # History deletion also removes the generated video when it is owned by
+    # this case, preventing deleted records from leaving large orphan files.
+    job_id = (record or {}).get("jobId")
+    if job_id:
+        job_store.delete_job(job_id)
+        (OUTPUT_DIR / f"{job_id}.mp4").unlink(missing_ok=True)
     return {"deleted": True, "case_id": case_id}
 
 
